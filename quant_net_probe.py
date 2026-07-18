@@ -29,7 +29,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 DEFAULT_CONFIG = Path(__file__).with_name("endpoints.json")
 
 PROFILES = {
@@ -457,6 +457,45 @@ def render_md(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_terminal(report: dict[str, Any], json_path: Path, markdown_path: Path, color: bool = True) -> str:
+    use_color=color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    codes={"reset":"\033[0m","bold":"\033[1m","green":"\033[32m","yellow":"\033[33m","red":"\033[31m","cyan":"\033[36m","dim":"\033[2m"} if use_color else {k:"" for k in ("reset","bold","green","yellow","red","cyan","dim")}
+    def paint(value: str, score: float) -> str:
+        c=codes["green"] if score>=75 else codes["yellow"] if score>=55 else codes["red"]
+        return f"{c}{value}{codes['reset']}"
+    def metric(label: str, score: float) -> str: return f"{label}: {paint(f'{score:.1f}/100 {grade(score)}',score)}"
+    s=report["summary"]; selection=float(s.get("selection_score",s["overall_score"])); perf=float(report.get("benchmark",{}).get("score",0)); lines=["",f"{codes['bold']}{codes['cyan']}量化服务器探针结果 · {report['label']}{codes['reset']}","="*64,metric("网络",float(s["overall_score"]))+"   "+metric("主机",perf)+"   "+metric("选择",selection),""]
+    lines += [f"{codes['bold']}分组评分{codes['reset']}"]
+    group_names={"ibkr":"IBKR","futu":"Futu","brokers":"其他券商","crypto":"Crypto","polymarket":"Polymarket","prediction":"预测市场","market_data":"行情源","infra":"基础设施","anchors":"区域锚点"}
+    lines.append("  ".join(f"{group_names.get(k,k)} {paint(f'{v:.1f}',v)}" for k,v in sorted(s["group_scores"].items())))
+    lines += ["",f"{codes['bold']}用途评分{codes['reset']}"]
+    role_names={"crypto_execution":"数字资产执行","ibkr_execution":"IBKR执行","futu_execution":"Futu执行","polymarket_execution":"Polymarket执行","market_data_node":"行情采集","research_backtest":"研究回测"}
+    for k,v in report.get("role_scores",{}).items():
+        value=f"{v['score']:.1f}/100 {v['grade']}"
+        lines.append(f"  {role_names.get(k,k):<18} {paint(value,v['score'])}")
+    caps=[e for e in report["endpoints"] if e.get("capability_evidence")]
+    if caps:
+        lines += ["",f"{codes['bold']}交易能力与地域{codes['reset']}"]
+        for e in caps:
+            c=e["capability_evidence"]; verdict=c.get("verdict","unknown"); good=verdict in ("geo_check_passed","perpetual_market_reachable","swap_market_reachable"); score=80 if good else 25
+            details=[]
+            if c.get("country"): details.append(str(c["country"]))
+            if c.get("live_perpetual_count") is not None: details.append(f"{c['live_perpetual_count']} 个 live 永续")
+            if c.get("live_swap_count") is not None: details.append(f"{c['live_swap_count']} 个 live SWAP")
+            lines.append(f"  {e['name']}: {paint(verdict,score)}"+(f" · {', '.join(details)}" if details else ""))
+    failed=[e for e in report["endpoints"] if e.get("tcp",{}).get("success_rate",0)==0]
+    blocked=[e for e in report["endpoints"] if e.get("http",{}).get("blocked")]
+    if failed or blocked:
+        lines += ["",f"{codes['bold']}异常摘要{codes['reset']}"]
+        if blocked: lines.append("  地域/WAF阻断: "+"、".join(e["name"] for e in blocked[:8]))
+        if failed: lines.append("  完全连接失败: "+"、".join(e["name"] for e in failed[:8])+(" …" if len(failed)>8 else ""))
+    lines += ["",f"{codes['bold']}判断与建议{codes['reset']}"]+[f"  • {x}" for x in report.get("recommendations",[])]
+    bw=report.get("bandwidth",{}).get("download_mbps")
+    if bw is not None: lines.append(f"  • 轻量单流下载约 {bw} Mbps（仅作线路健康参考）")
+    lines += ["",f"{codes['dim']}JSON: {json_path}",f"Markdown: {markdown_path}{codes['reset']}","="*64]
+    return "\n".join(lines)
+
+
 def load_config(path: str) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as f: data=json.load(f)
     return data["endpoints"] if isinstance(data,dict) else data
@@ -515,7 +554,9 @@ def cmd_probe(a: argparse.Namespace) -> int:
     report["role_scores"]=role_scores(report)
     report["recommendations"]=recommendations(report)
     slug=re.sub(r"[^A-Za-z0-9_.-]+","-",report["label"]).strip("-") or "server"; stamp=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    jp=out/f"probe-{slug}-{stamp}.json"; mp=out/f"probe-{slug}-{stamp}.md"; jp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8"); mp.write_text(render_md(report),encoding="utf-8"); print(json.dumps({"json":str(jp),"markdown":str(mp),"overall_score":overall},ensure_ascii=False)); return 0
+    jp=out/f"probe-{slug}-{stamp}.json"; mp=out/f"probe-{slug}-{stamp}.md"; jp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8"); mp.write_text(render_md(report),encoding="utf-8")
+    if not a.no_terminal_summary: print(render_terminal(report,jp,mp))
+    print("RESULT_JSON="+json.dumps({"json":str(jp),"markdown":str(mp),"overall_score":overall,"selection_score":report["summary"].get("selection_score")},ensure_ascii=False)); return 0
 
 
 def cmd_compare(a: argparse.Namespace) -> int:
@@ -529,13 +570,19 @@ def cmd_compare(a: argparse.Namespace) -> int:
     else:
         directory,fallback=choose_output_dir(None); out=directory/"server-comparison.md"
         if fallback: print(f"[i] Current directory is not writable; report will be saved to: {out}",file=sys.stderr)
-    out.parent.mkdir(parents=True,exist_ok=True); out.write_text("\n".join(lines)+"\n",encoding="utf-8"); print(str(out)); return 0
+    rendered="\n".join(lines)+"\n"; out.parent.mkdir(parents=True,exist_ok=True); out.write_text(rendered,encoding="utf-8"); print(rendered); print(f"Saved: {out}"); return 0
+
+
+def cmd_show(a: argparse.Namespace) -> int:
+    path=Path(a.file).expanduser(); report=json.loads(path.read_text(encoding="utf-8")); markdown=path.with_suffix(".md")
+    print(render_terminal(report,path,markdown,color=not a.no_color)); return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(description="Quant trading server network probe"); p.add_argument("--version",action="version",version=VERSION); sub=p.add_subparsers(dest="cmd",required=True)
-    q=sub.add_parser("probe",help="Probe configured public endpoints"); q.add_argument("--config",default=str(DEFAULT_CONFIG)); q.add_argument("--label"); q.add_argument("--provider",default=""); q.add_argument("--region",default=""); q.add_argument("--profile",choices=PROFILES,default="balanced"); q.add_argument("--suite",choices=("core","extended"),default="core"); q.add_argument("--groups",help="comma-separated groups"); q.add_argument("--target",action="append",default=[],help="extra TCP target: NAME=HOST:PORT (repeatable)"); q.add_argument("--rounds",type=int,default=5); q.add_argument("--quick",action="store_true"); q.add_argument("--timeout",type=float,default=4.0); q.add_argument("--workers",type=int,default=8); q.add_argument("--routes",action="store_true"); q.add_argument("--max-routes",type=int,default=5); q.add_argument("--futu-host",help="FutuOpenD host, usually 127.0.0.1"); q.add_argument("--futu-port",type=int,default=11111); q.add_argument("--ib-host",help="IB Gateway/TWS API host, usually 127.0.0.1"); q.add_argument("--ib-port",type=int,default=4002); q.add_argument("--live-sessions",action="store_true",help="include kernel RTT for running IB/Futu gateways"); q.add_argument("--session-pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); q.add_argument("--no-benchmark",action="store_true"); q.add_argument("--no-bandwidth",action="store_true"); q.add_argument("--benchmark-level",choices=("light","standard"),default="light"); q.add_argument("--output",help="report directory; auto-selects a writable directory when omitted"); q.set_defaults(func=cmd_probe)
+    q=sub.add_parser("probe",help="Probe configured public endpoints"); q.add_argument("--config",default=str(DEFAULT_CONFIG)); q.add_argument("--label"); q.add_argument("--provider",default=""); q.add_argument("--region",default=""); q.add_argument("--profile",choices=PROFILES,default="balanced"); q.add_argument("--suite",choices=("core","extended"),default="core"); q.add_argument("--groups",help="comma-separated groups"); q.add_argument("--target",action="append",default=[],help="extra TCP target: NAME=HOST:PORT (repeatable)"); q.add_argument("--rounds",type=int,default=5); q.add_argument("--quick",action="store_true"); q.add_argument("--timeout",type=float,default=4.0); q.add_argument("--workers",type=int,default=8); q.add_argument("--routes",action="store_true"); q.add_argument("--max-routes",type=int,default=5); q.add_argument("--futu-host",help="FutuOpenD host, usually 127.0.0.1"); q.add_argument("--futu-port",type=int,default=11111); q.add_argument("--ib-host",help="IB Gateway/TWS API host, usually 127.0.0.1"); q.add_argument("--ib-port",type=int,default=4002); q.add_argument("--live-sessions",action="store_true",help="include kernel RTT for running IB/Futu gateways"); q.add_argument("--session-pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); q.add_argument("--no-benchmark",action="store_true"); q.add_argument("--no-bandwidth",action="store_true"); q.add_argument("--no-terminal-summary",action="store_true"); q.add_argument("--benchmark-level",choices=("light","standard"),default="light"); q.add_argument("--output",help="report directory; auto-selects a writable directory when omitted"); q.set_defaults(func=cmd_probe)
     c=sub.add_parser("compare",help="Compare JSON reports"); c.add_argument("files",nargs="+"); c.add_argument("--output"); c.set_defaults(func=cmd_compare)
+    s=sub.add_parser("show",help="Render an existing JSON report in the terminal"); s.add_argument("file"); s.add_argument("--no-color",action="store_true"); s.set_defaults(func=cmd_show)
     d=sub.add_parser("discover",help="Read kernel RTT for established IB/Futu gateway sockets"); d.add_argument("--pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); d.add_argument("--output"); d.set_defaults(func=lambda a:(Path(a.output).write_text(json.dumps(tcp_socket_discovery(a.pattern),ensure_ascii=False,indent=2),encoding="utf-8") if a.output else print(json.dumps(tcp_socket_discovery(a.pattern),ensure_ascii=False,indent=2))) or 0)
     return p
 

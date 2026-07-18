@@ -40,7 +40,7 @@ download "$BASE_URL/endpoints.json" "$WORK_DIR/endpoints.json"
 
 if (($# == 0)); then
   set -- probe --label "$(hostname 2>/dev/null || echo candidate-server)" --profile balanced
-elif [[ "$1" != "probe" && "$1" != "compare" && "$1" != "discover" ]]; then
+elif [[ "$1" != "probe" && "$1" != "compare" && "$1" != "show" && "$1" != "discover" ]]; then
   set -- probe "$@"
 fi
 
