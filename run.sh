@@ -1,21 +1,47 @@
-MIT License
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-Copyright (c) 2026 puyang525
+REPOSITORY="${QUANT_PROBE_REPOSITORY:-puyang525/quant-server-probe}"
+VERSION="${QUANT_PROBE_VERSION:-main}"
+BASE_URL="https://raw.githubusercontent.com/${REPOSITORY}/${VERSION}"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quant-server-probe.XXXXXXXX")"
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+cleanup() {
+  rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT INT TERM HUP
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: Python 3.10+ is required." >&2
+  exit 2
+fi
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
+  echo "Error: Python 3.10+ is required." >&2
+  exit 2
+}
+
+download() {
+  local source="$1" destination="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location \
+      --connect-timeout 10 --max-time 60 \
+      "$source" --output "$destination"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --quiet --timeout=60 --output-document="$destination" "$source"
+  else
+    echo "Error: curl or wget is required." >&2
+    exit 2
+  fi
+}
+
+download "$BASE_URL/quant_net_probe.py" "$WORK_DIR/quant_net_probe.py"
+download "$BASE_URL/endpoints.json" "$WORK_DIR/endpoints.json"
+
+if (($# == 0)); then
+  set -- probe --label "$(hostname 2>/dev/null || echo candidate-server)" --profile balanced
+elif [[ "$1" != "probe" && "$1" != "compare" && "$1" != "discover" ]]; then
+  set -- probe "$@"
+fi
+
+python3 "$WORK_DIR/quant_net_probe.py" "$@"
