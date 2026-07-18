@@ -29,7 +29,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DEFAULT_CONFIG = Path(__file__).with_name("endpoints.json")
 
 PROFILES = {
@@ -462,7 +462,25 @@ def load_config(path: str) -> list[dict[str, Any]]:
     return data["endpoints"] if isinstance(data,dict) else data
 
 
+def choose_output_dir(requested: str | None) -> tuple[Path, bool]:
+    """Choose a writable report directory without failing after a long probe."""
+    if requested:
+        candidates=[Path(requested).expanduser()]
+    else:
+        candidates=[Path.cwd()/"probe-results", Path.home()/"quant-server-probe-results", Path(tempfile.gettempdir())/f"quant-server-probe-results-{os.getuid() if hasattr(os,'getuid') else 'user'}"]
+    errors=[]
+    for i,path in enumerate(candidates):
+        try:
+            path.mkdir(parents=True,exist_ok=True)
+            if not os.access(path,os.W_OK|os.X_OK): raise PermissionError(f"not writable: {path}")
+            return path, (not requested and i>0)
+        except OSError as e: errors.append(f"{path}: {e}")
+    raise PermissionError("No writable output directory. " + " | ".join(errors))
+
+
 def cmd_probe(a: argparse.Namespace) -> int:
+    out,fallback=choose_output_dir(a.output)
+    if fallback: print(f"[i] Current directory is not writable; reports will be saved to: {out}",file=sys.stderr)
     eps=load_config(a.config); eps=[x for x in eps if a.suite=="extended" or x.get("suite","core")=="core"]; groups=set(a.groups.split(",")) if a.groups else None
     for target in a.target:
         try:
@@ -495,7 +513,8 @@ def cmd_probe(a: argparse.Namespace) -> int:
         report["summary"]["selection_score"] = round(overall*(1-perf_weight)+report["benchmark"]["score"]*perf_weight,1)
         report["summary"]["grade"] = grade(report["summary"]["selection_score"])
     report["role_scores"]=role_scores(report)
-    report["recommendations"]=recommendations(report); out=Path(a.output); out.mkdir(parents=True,exist_ok=True); slug=re.sub(r"[^A-Za-z0-9_.-]+","-",report["label"]).strip("-") or "server"; stamp=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report["recommendations"]=recommendations(report)
+    slug=re.sub(r"[^A-Za-z0-9_.-]+","-",report["label"]).strip("-") or "server"; stamp=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     jp=out/f"probe-{slug}-{stamp}.json"; mp=out/f"probe-{slug}-{stamp}.md"; jp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8"); mp.write_text(render_md(report),encoding="utf-8"); print(json.dumps({"json":str(jp),"markdown":str(mp),"overall_score":overall},ensure_ascii=False)); return 0
 
 
@@ -506,13 +525,17 @@ def cmd_compare(a: argparse.Namespace) -> int:
         g=r["summary"]["group_scores"]; lines.append(f"| {i} | {r['label']} | {r.get('provider','')}/{r.get('region','')} | {r['summary'].get('selection_score',r['summary']['overall_score'])} | {r.get('benchmark',{}).get('score','—')} | {g.get('ibkr','—')} | {g.get('futu','—')} | {g.get('crypto','—')} | {g.get('polymarket','—')} | {g.get('market_data','—')} |")
     lines += ["","## 结论",""]
     if rows: lines.append(f"- 当前配置档下首选 **{rows[0]['label']}**（选择分 {rows[0]['summary'].get('selection_score',rows[0]['summary']['overall_score'])}）。这只是同批样本的相对结论，需结合真实 IB 会话与 24–72 小时稳定性。")
-    out=Path(a.output); out.write_text("\n".join(lines)+"\n",encoding="utf-8"); print(str(out)); return 0
+    if a.output: out=Path(a.output).expanduser()
+    else:
+        directory,fallback=choose_output_dir(None); out=directory/"server-comparison.md"
+        if fallback: print(f"[i] Current directory is not writable; report will be saved to: {out}",file=sys.stderr)
+    out.parent.mkdir(parents=True,exist_ok=True); out.write_text("\n".join(lines)+"\n",encoding="utf-8"); print(str(out)); return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(description="Quant trading server network probe"); p.add_argument("--version",action="version",version=VERSION); sub=p.add_subparsers(dest="cmd",required=True)
-    q=sub.add_parser("probe",help="Probe configured public endpoints"); q.add_argument("--config",default=str(DEFAULT_CONFIG)); q.add_argument("--label"); q.add_argument("--provider",default=""); q.add_argument("--region",default=""); q.add_argument("--profile",choices=PROFILES,default="balanced"); q.add_argument("--suite",choices=("core","extended"),default="core"); q.add_argument("--groups",help="comma-separated groups"); q.add_argument("--target",action="append",default=[],help="extra TCP target: NAME=HOST:PORT (repeatable)"); q.add_argument("--rounds",type=int,default=5); q.add_argument("--quick",action="store_true"); q.add_argument("--timeout",type=float,default=4.0); q.add_argument("--workers",type=int,default=8); q.add_argument("--routes",action="store_true"); q.add_argument("--max-routes",type=int,default=5); q.add_argument("--futu-host",help="FutuOpenD host, usually 127.0.0.1"); q.add_argument("--futu-port",type=int,default=11111); q.add_argument("--ib-host",help="IB Gateway/TWS API host, usually 127.0.0.1"); q.add_argument("--ib-port",type=int,default=4002); q.add_argument("--live-sessions",action="store_true",help="include kernel RTT for running IB/Futu gateways"); q.add_argument("--session-pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); q.add_argument("--no-benchmark",action="store_true"); q.add_argument("--no-bandwidth",action="store_true"); q.add_argument("--benchmark-level",choices=("light","standard"),default="light"); q.add_argument("--output",default="probe-results"); q.set_defaults(func=cmd_probe)
-    c=sub.add_parser("compare",help="Compare JSON reports"); c.add_argument("files",nargs="+"); c.add_argument("--output",default="server-comparison.md"); c.set_defaults(func=cmd_compare)
+    q=sub.add_parser("probe",help="Probe configured public endpoints"); q.add_argument("--config",default=str(DEFAULT_CONFIG)); q.add_argument("--label"); q.add_argument("--provider",default=""); q.add_argument("--region",default=""); q.add_argument("--profile",choices=PROFILES,default="balanced"); q.add_argument("--suite",choices=("core","extended"),default="core"); q.add_argument("--groups",help="comma-separated groups"); q.add_argument("--target",action="append",default=[],help="extra TCP target: NAME=HOST:PORT (repeatable)"); q.add_argument("--rounds",type=int,default=5); q.add_argument("--quick",action="store_true"); q.add_argument("--timeout",type=float,default=4.0); q.add_argument("--workers",type=int,default=8); q.add_argument("--routes",action="store_true"); q.add_argument("--max-routes",type=int,default=5); q.add_argument("--futu-host",help="FutuOpenD host, usually 127.0.0.1"); q.add_argument("--futu-port",type=int,default=11111); q.add_argument("--ib-host",help="IB Gateway/TWS API host, usually 127.0.0.1"); q.add_argument("--ib-port",type=int,default=4002); q.add_argument("--live-sessions",action="store_true",help="include kernel RTT for running IB/Futu gateways"); q.add_argument("--session-pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); q.add_argument("--no-benchmark",action="store_true"); q.add_argument("--no-bandwidth",action="store_true"); q.add_argument("--benchmark-level",choices=("light","standard"),default="light"); q.add_argument("--output",help="report directory; auto-selects a writable directory when omitted"); q.set_defaults(func=cmd_probe)
+    c=sub.add_parser("compare",help="Compare JSON reports"); c.add_argument("files",nargs="+"); c.add_argument("--output"); c.set_defaults(func=cmd_compare)
     d=sub.add_parser("discover",help="Read kernel RTT for established IB/Futu gateway sockets"); d.add_argument("--pattern",default=r"ibgateway|tws|java|FutuOpenD|OpenD"); d.add_argument("--output"); d.set_defaults(func=lambda a:(Path(a.output).write_text(json.dumps(tcp_socket_discovery(a.pattern),ensure_ascii=False,indent=2),encoding="utf-8") if a.output else print(json.dumps(tcp_socket_discovery(a.pattern),ensure_ascii=False,indent=2))) or 0)
     return p
 
